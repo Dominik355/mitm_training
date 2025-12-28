@@ -1,13 +1,15 @@
 // TODO: remove the line below when working on the file
 #![expect(unused_variables, dead_code)]
 
+use alloc::collections;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::net::Ipv4Addr;
 
-use anyhow::{Result, bail};
-use log::LevelFilter;
+use anyhow::{Result, anyhow, bail};
+use log::{LevelFilter, info};
 use pnet::packet::Packet;
-use pnet::packet::tcp::{TcpFlags, TcpPacket};
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
 use rand::Rng;
 
 use crate::models::{AppBuffer, ConnectionId};
@@ -71,7 +73,33 @@ fn craft_tcp_packet(
     // TODO: Exercise 3.0
     // Implement the crafting of a valid TCP packet with the given parameters.
     // Make sure the TCP checksum for the packet is correct.
-    unimplemented!("missing craft_tcp_packet implementation");
+    let mut tcp_data = vec![
+        0u8;
+        TcpPacket::minimum_packet_size()
+            + data.as_ref().map(|d| d.len()).unwrap_or_default()
+    ];
+    let mut tcp_pkt = MutableTcpPacket::new(&mut tcp_data).expect("cannot build tcp packet");
+
+    tcp_pkt.set_source(connection_id.dst_port());
+    tcp_pkt.set_destination(connection_id.src_port());
+    tcp_pkt.set_sequence(seq);
+    tcp_pkt.set_acknowledgement(ack);
+    tcp_pkt.set_flags(flags);
+    tcp_pkt.set_data_offset(20 / 4);
+    tcp_pkt.set_window(u16::MAX);
+    if let Some(data) = data {
+        tcp_pkt.set_payload(data.as_ref());
+    }
+
+    tcp_pkt.set_checksum(pnet::packet::tcp::ipv4_checksum(
+        &tcp_pkt.to_immutable(),
+        &connection_id.dst_ip(),
+        &connection_id.src_ip(),
+    ));
+
+    info!("Replying TCP packet: \n{:#?}", tcp_pkt);
+
+    Ok(tcp_data)
 }
 
 pub struct TcpHandler {
@@ -109,6 +137,8 @@ impl TcpHandler {
         let Some(inbound_tcp_packet) = TcpPacket::new(packet) else {
             bail!("cannot create tcp packet...")
         };
+
+        info!("Received TCP packet : {:#?}", inbound_tcp_packet);
 
         let src_ip = options.src_ip;
         let dst_ip = options.dst_ip;
@@ -158,7 +188,11 @@ impl TcpHandler {
 
         if fin_flag_set {
             log::trace!("received FIN from {src_ip}:{src_port}");
-            return self.handle_tcp_fin(&connection_id, seq);
+            return self.handle_tcp_fin(
+                &connection_id,
+                seq,
+                inbound_tcp_packet.get_acknowledgement(),
+            );
         }
 
         if syn_flag_set {
@@ -202,18 +236,68 @@ impl TcpHandler {
         connection_id: &ConnectionId,
         seq_number: u32,
     ) -> Result<Option<Vec<u8>>> {
-        // TODO: Exercise 3.1
-        // Implement the handling of a packet containing a TCP SYN flag. This
-        // function performs an early return in our TCP state machine, so no
-        // other handler will be called even if the incoming packet contains
-        // additional flags.
-        Ok(None)
+        let conn = TcpConnectionInfo::new(seq_number);
+        let server_initial_seq = conn.server_seq_number;
+
+        self.active_connections
+            .insert(connection_id.to_owned(), conn);
+
+        // Send SYN-ACK
+        Ok(Some(craft_tcp_packet(
+            connection_id,
+            server_initial_seq,
+            seq_number + 1,
+            TcpFlags::SYN | TcpFlags::ACK,
+            None,
+        )?))
     }
 
     fn handle_tcp_ack(&mut self, connection_id: &ConnectionId, ack: u32) -> Result<()> {
         // TODO: Exercise 3.2
         // Implement the handling of a packet containing a TCP ACK flag. This
         // function can be called alongside `handle_tcp_psh`.
+
+        let mut connection = self
+            .active_connections
+            .get_mut(connection_id)
+            .ok_or(anyhow!(
+                "Obtained ACK for non existing connection:  {connection_id:?}"
+            ))?;
+
+        match connection.state {
+            TcpState::InitialSynReceived => {
+                if ack != connection.server_seq_number + 1 {
+                    bail!(
+                        "ACK mismatch! Expected {}, got {}",
+                        connection.server_seq_number,
+                        ack
+                    )
+                }
+
+                log::info!(
+                    "opened tcp connection with {}:{}",
+                    connection_id.src_ip(),
+                    connection_id.src_port()
+                );
+
+                connection.state = TcpState::Established;
+                connection.server_seq_number = ack;
+            }
+            TcpState::Established => {}
+            TcpState::Closing => {
+                let conn = self.active_connections.remove(connection_id);
+                let (total_amount_rx, total_amount_tx) = conn
+                    .map(|c| (c.total_data_rx, c.total_data_tx))
+                    .unwrap_or_default();
+
+                info!(
+                    "closed connection with {}:{}. rx_data={total_amount_rx} tx_data={total_amount_tx}",
+                    connection_id.src_ip(),
+                    connection_id.src_port()
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -230,29 +314,77 @@ impl TcpHandler {
         // depending on the payload type.
         // Once you have implemented the logic for handling any TCP packet,
         // the payload type.
-        Ok(None)
+
+        let mut connection = self
+            .active_connections
+            .get_mut(connection_id)
+            .ok_or(anyhow!(
+                "Obtained PSH before SYN for connection {connection_id:?}"
+            ))?;
+
+        let data_len = data.len();
+
+        connection.total_data_rx += data_len;
+
+        if seq_number != connection.client_seq_number + 1 {
+            bail!(
+                "Was expecting {} seq number but received {}",
+                connection.server_seq_number + 1,
+                seq_number
+            );
+        }
+
+        let mut buffer = AppBuffer::new(seq_number);
+        buffer.insert(seq_number, data);
+        let data = self.echo.handle_packet(&mut buffer, ())?;
+
+        data.as_ref()
+            .inspect(|d| connection.total_data_tx += d.len());
+
+        craft_tcp_packet(
+            connection_id,
+            connection.server_seq_number + 1,
+            connection.client_seq_number + 1 + data_len as u32,
+            TcpFlags::PSH | TcpFlags::ACK,
+            data,
+        )
+        .map(Some)
     }
 
     fn handle_tcp_fin(
         &mut self,
         connection_id: &ConnectionId,
         seq_number: u32,
+        ack_number: u32,
     ) -> Result<Option<Vec<u8>>> {
         // TODO: Exercise 3.5
         // Implement the handling of a packet containing a TCP FIN flag. This
         // function performs an early return in our TCP state machine, so no
         // other handler will be called even if the incoming packet contains
         // additional flags.
-        // Once correctly implemented, you should pass test case #2.
-        Ok(None)
+        // Once correctly implemented, you should pass test case #3.
+
+        let mut connection = self
+            .active_connections
+            .get_mut(connection_id)
+            .ok_or(anyhow!(
+                "Obtained FIN for not existing connection {connection_id:?}"
+            ))?;
+
+        connection.state = TcpState::Closing;
+
+        craft_tcp_packet(
+            connection_id,
+            ack_number,
+            seq_number + 1,
+            TcpFlags::ACK | TcpFlags::FIN,
+            None,
+        )
+        .map(Some)
     }
 
     fn handle_tcp_rst(&mut self, connection_id: &ConnectionId) -> Result<Option<Vec<u8>>> {
-        // TODO: Exercise 3.6 - Optional
-        // Implement the handling of a packet containing a TCP RST flag. This
-        // function performs an early return in our TCP state machine, so no
-        // other handler will be called even if the incoming packet contains
-        // additional flags.
+        self.active_connections.remove(connection_id);
         Ok(None)
     }
 }

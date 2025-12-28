@@ -4,6 +4,7 @@
 use std::io::Read;
 
 use anyhow::Result;
+use log::info;
 
 pub struct EchoHandler {}
 
@@ -31,7 +32,13 @@ impl EchoHandler {
             return Ok(None);
         }
 
-        Ok(None)
+        let mut buf = vec![];
+
+        packet.read_to_end(&mut buf)?;
+
+        info!("Responding to echo");
+
+        Ok(Some(buf))
     }
 
     fn should_intercept(&self) -> bool {

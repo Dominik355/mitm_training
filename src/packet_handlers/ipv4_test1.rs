@@ -2,6 +2,7 @@
 #![expect(unused_variables, dead_code)]
 
 use anyhow::Result;
+use log::info;
 
 pub struct Ipv4Test1Handler {}
 
@@ -23,11 +24,17 @@ impl Ipv4Test1Handler {
         // This service should echo back the received packet.
         // Once correctly implemented, you should pass test case #2.
 
+        info!(
+            "Handling Test1 IPV4 [{}]: {:?}",
+            packet.len(),
+            String::from_utf8_lossy(&packet)
+        );
+
         if !self.should_intercept() {
             return Ok(None);
         }
 
-        Ok(None)
+        Ok(Some(packet.to_vec()))
     }
 
     fn should_intercept(&self) -> bool {
