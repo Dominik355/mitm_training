@@ -1,0 +1,1 @@
+Man in the middle training from Rustlab 2025 in Florence
